@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/coredhcp/coredhcp/handler"
@@ -38,7 +39,7 @@ var Plugin = plugins.Plugin{
 // PluginState is the data held by an instance of the range plugin
 type PluginState struct {
 	LeaseTime time.Duration
-	storage   StorageProvider
+	storage   *RedisProvider
 	allocator allocators.Allocator
 }
 
@@ -118,7 +119,7 @@ func setup4(args ...string) (handler.Handler4, error) {
 		return nil, fmt.Errorf("invalid lease duration: %v", args[3])
 	}
 
-	p.storage, err = ParseURI(uri)
+	p.storage, err = InitStorage(uri)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +140,37 @@ func setup4(args ...string) (handler.Handler4, error) {
 			return nil, fmt.Errorf("allocator did not re-allocate requested leased ip %v: %v", v.IP.String(), ip.String())
 		}
 	}
+
+	// Launch a goroutine to gc the IP lease
+	go func() {
+		ch := p.storage.SubExp.Channel()
+		defer p.storage.SubExp.Close()
+
+		for msg := range ch {
+			if !strings.HasPrefix(msg.Payload, REDIS_SHADOW_KEY_PREFIX) {
+				continue
+			}
+
+			mac := msg.Payload[len(REDIS_SHADOW_KEY_PREFIX):]
+			record, err := p.storage.GetRecord(mac)
+			if err != nil {
+				log.Errorln("error when getting expired record", err)
+				continue
+			}
+
+			err = p.allocator.Free(net.IPNet{
+				IP:   record.IP,
+				Mask: net.IPv4Mask(255, 255, 255, 255),
+			})
+
+			if err != nil {
+				log.Errorf("error when release ip %v, err: %v", record.IP, err)
+				continue
+			}
+
+			log.Infof("IP lease %s for MAC address %s is expire.", record.IP, mac)
+		}
+	}()
 
 	return p.Handler4, nil
 }
